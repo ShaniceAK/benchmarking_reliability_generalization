@@ -127,7 +127,6 @@ class EncoderDecoder(BaseSegmentor):
         def count_parameters(model):
             return sum(p.numel() for p in model.parameters() if p.requires_grad)
         
-        #        print("Number of parameters: ", count_parameters(self))
 
     def _init_decode_head(self, decode_head: ConfigType) -> None:
         """Initialize ``decode_head``"""
@@ -161,8 +160,6 @@ class EncoderDecoder(BaseSegmentor):
         seg_logits = self.decode_head.predict(x, batch_img_metas, self.test_cfg)
         #seg_logits = self.decode_head.forward(x, batch_img_metas, self.test_cfg)
 
-        #        print(seg_logits.requires_grad)
-        #        print(seg_logits.grad_fn)
 
         return seg_logits
 
@@ -599,8 +596,6 @@ class EncoderDecoder(BaseSegmentor):
                 segmentation before normalization.
         """
 
-        #        print("\n=== predict() called ===")
-        #        print("torch.is_grad_enabled():", torch.is_grad_enabled())
 
         if data_samples is not None:
             batch_img_metas = [
@@ -615,7 +610,6 @@ class EncoderDecoder(BaseSegmentor):
                     padding_size=[0, 0, 0, 0])
             ] * inputs.shape[0]
         
-        # print(f"old: epsilon={self.attack_cfg['epsilon']}, alpha={self.attack_cfg['alpha']}")
 
         # old version: 
         # self.attack_cfg["epsilon"] = self.attack_cfg["epsilon"]/255 if inputs.max() <= 1 else self.attack_cfg["epsilon"]
@@ -627,7 +621,6 @@ class EncoderDecoder(BaseSegmentor):
             epsilon = self.attack_cfg["epsilon"]/255 if inputs.max() <= 1 else self.attack_cfg["epsilon"]
             alpha = self.attack_cfg["alpha"]*255 if inputs.max() > 1 else self.attack_cfg["alpha"]
 
-        # print(f"new: epsilon={epsilon}, alpha={alpha}")
 
         
 
@@ -714,10 +707,6 @@ class EncoderDecoder(BaseSegmentor):
                                         align_corners=self.align_corners,
                                         warning=False)
                         
-                        #                        print("\nImmediately after computing logits")
-                        #                        print("torch.is_grad_enabled():", torch.is_grad_enabled())
-                        #                        print("resized_seg_logits.requires_grad:", resized_seg_logits.requires_grad)
-                        #                        print("resized_seg_logits.grad_fn:", resized_seg_logits.grad_fn)
                         
                         if self.attack_cfg['name'] == 'cospgd':
                             with torch.no_grad():
@@ -738,48 +727,19 @@ class EncoderDecoder(BaseSegmentor):
                         elif self.attack_cfg['name'] == 'segpgd':
                             loss = self.segpgd_scale(resized_seg_logits, data_samples[-1].gt_sem_seg.data, loss, iteration=itr, iterations=self.attack_cfg['iterations'], targeted=self.attack_cfg['targeted'])
                     
-                    #                    print(type(loss), flush=True)
-                    #                    print(loss.shape, flush=True)
-                    #                    print(loss.dtype, flush=True)
 
-                    #                    print("\n" + "=" * 70)
-                    #                    print(">>> ENTERED predict()")
-                    #                    print("=" * 70)
 
-                    #                    print("Grad enabled:", torch.is_grad_enabled())
 
-                    #                    print("\nINPUT")
-                    #                    print("inputs.requires_grad:", inputs.requires_grad)
-                    #                    print("inputs.grad_fn:", inputs.grad_fn)
 
-                    #                    print("\nLOGITS")
-                    #                    print("resized_seg_logits.requires_grad:", resized_seg_logits.requires_grad)
-                    #                    print("resized_seg_logits.grad_fn:", resized_seg_logits.grad_fn)
-                    #                    print("resized_seg_logits.dtype:", resized_seg_logits.dtype)
-                    #                    print("resized_seg_logits.shape:", resized_seg_logits.shape)
 
-                    #                    print("\nLOSS")
-                    #                    print("loss type:", type(loss))
-                    #                    print("loss.requires_grad:", loss.requires_grad)
-                    #                    print("loss.grad_fn:", loss.grad_fn)
-                    #                    print("loss.shape:", loss.shape)
-                    #                    print("loss.dtype:", loss.dtype)
 
-                    m = loss.mean()
 
-                    #                    print("\nMEAN LOSS")
-                    #                    print("m.requires_grad:", m.requires_grad)
-                    #                    print("m.grad_fn:", m.grad_fn)
-                    #                    print("m:", m)
 
-                    #                    print("=" * 70 + "\n")
+
 
 
 
                     with torch.enable_grad():
-                        #                        print("Grad enabled:", torch.is_grad_enabled(), flush=True)
-                        #                        print("loss.requires_grad:", loss.requires_grad, flush=True)
-                        #                        print("loss.grad_fn:", loss.grad_fn, flush=True)
                     
                         loss.mean().backward()
                     
