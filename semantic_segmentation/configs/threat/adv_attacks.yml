@@ -1,5 +1,7 @@
-threat_model: "PGD"
+threat_model: CosPGD
 iterations: 20
-epsilon: 8.0
+epsilon: 8.0  #this symbolizes 8 out of 255
 alpha: 0.01
-lp_norm: "Linf"
+lp_norm: Linf
+
+

@@ -90,7 +90,8 @@ class EncoderDecoder(BaseSegmentor):
                  attack_cfg: ConfigType=None,
                  normalize_mean_std: ConfigType=None,
                  enable_normalization: bool = False,
-                 perform_attack: bool=False):
+                 perform_attack: bool=False,
+         adv_train_cfg: ConfigType=None):
         # import pdb
         # pdb.set_trace()
         super().__init__(
@@ -115,7 +116,8 @@ class EncoderDecoder(BaseSegmentor):
         self.criterion = MODELS.build(self.attack_loss) 
         self.perform_attack=perform_attack
         self.enable_normalization = enable_normalization
-        
+        self.adv_train_cfg = adv_train_cfg
+
         self.mean=normalize_mean_std['mean']
         self.std=normalize_mean_std['std']
         self.counter=0
@@ -125,7 +127,7 @@ class EncoderDecoder(BaseSegmentor):
         def count_parameters(model):
             return sum(p.numel() for p in model.parameters() if p.requires_grad)
         
-        print("Number of parameters: ", count_parameters(self))
+        #        print("Number of parameters: ", count_parameters(self))
 
     def _init_decode_head(self, decode_head: ConfigType) -> None:
         """Initialize ``decode_head``"""
@@ -156,8 +158,11 @@ class EncoderDecoder(BaseSegmentor):
         """Encode images with backbone and decode into a semantic segmentation
         map of the same size as input."""
         x = self.extract_feat(inputs)
-        seg_logits = self.decode_head.predict(x, batch_img_metas,
-                                              self.test_cfg)
+        seg_logits = self.decode_head.predict(x, batch_img_metas, self.test_cfg)
+        #seg_logits = self.decode_head.forward(x, batch_img_metas, self.test_cfg)
+
+        #        print(seg_logits.requires_grad)
+        #        print(seg_logits.grad_fn)
 
         return seg_logits
 
@@ -247,7 +252,61 @@ class EncoderDecoder(BaseSegmentor):
         del predictions
         torch.cuda.empty_cache()
         
-        return cossim.detach()        
+        return cossim.detach()
+
+    def l2_scale(self, predictions, labels, loss, num_classes=None, targeted=False, one_hot=True):
+        if one_hot:
+            transformed_target = torch.nn.functional.one_hot(torch.clamp(labels, 0, num_classes-1), num_classes=num_classes).permute(0,3,1,2).float()
+        else:
+            transformed_target = torch.nn.functional.softmax(labels, dim=1)
+        pred_softmax = torch.nn.functional.softmax(predictions, dim=1)
+        similarity = 1.0 / (1.0 + torch.norm(pred_softmax - transformed_target, p=2, dim=1))
+        if targeted:
+            similarity = 1 - similarity
+        del transformed_target, predictions
+        torch.cuda.empty_cache()
+        return similarity.detach()
+
+    def l1_scale(self, predictions, labels, loss, num_classes=None, targeted=False, one_hot=True):
+        if one_hot:
+            transformed_target = torch.nn.functional.one_hot(torch.clamp(labels, 0, num_classes-1), num_classes=num_classes).permute(0,3,1,2).float()
+        else:
+            transformed_target = torch.nn.functional.softmax(labels, dim=1)
+        pred_softmax = torch.nn.functional.softmax(predictions, dim=1)
+        similarity = 1.0 / (1.0 + torch.norm(pred_softmax - transformed_target, p=1, dim=1))
+        if targeted:
+            similarity = 1 - similarity
+        del transformed_target, predictions
+        torch.cuda.empty_cache()
+        return similarity.detach()
+
+    def jaccard_scale(self, predictions, labels, loss, num_classes=None, targeted=False, one_hot=True):
+        if one_hot:
+            transformed_target = torch.nn.functional.one_hot(torch.clamp(labels, 0, num_classes-1), num_classes=num_classes).permute(0,3,1,2).float()
+        else:
+            transformed_target = torch.nn.functional.softmax(labels, dim=1)
+        pred_softmax = torch.nn.functional.softmax(predictions, dim=1)
+        intersection = (pred_softmax * transformed_target).sum(dim=1)
+        union = (pred_softmax + transformed_target - pred_softmax * transformed_target).sum(dim=1)
+        similarity = intersection / (union + 1e-8)
+        if targeted:
+            similarity = 1 - similarity
+        del transformed_target, predictions
+        torch.cuda.empty_cache()
+        return similarity.detach()
+
+    def minkowski_scale(self, predictions, labels, loss, num_classes=None, targeted=False, one_hot=True, p=3):
+        if one_hot:
+            transformed_target = torch.nn.functional.one_hot(torch.clamp(labels, 0, num_classes-1), num_classes=num_classes).permute(0,3,1,2).float()
+        else:
+            transformed_target = torch.nn.functional.softmax(labels, dim=1)
+        pred_softmax = torch.nn.functional.softmax(predictions, dim=1)
+        similarity = 1.0 / (1.0 + torch.norm(pred_softmax - transformed_target, p=p, dim=1))
+        if targeted:
+            similarity = 1 - similarity
+        del transformed_target, predictions
+        torch.cuda.empty_cache()
+        return similarity.detach()
 
     def apgd(
             self,
@@ -429,6 +488,96 @@ class EncoderDecoder(BaseSegmentor):
 
         return losses
 
+    def train_step(self, data, optim_wrapper):
+        """Adversarial training step: attacks 50% of the batch with CosPGD (using training-specific settings from adv_train_cfg)
+        before running normal training on the mixed clean/adversarial batch.
+        """
+
+        data = self.data_preprocessor(data,training=True)
+        inputs = data['inputs']
+        data_samples = data['data_samples']
+
+        if self.adv_train_cfg is not None:
+            batch_size = inputs.shape[0]
+            num_attack = batch_size // 2
+            indices = torch.randperm(batch_size)[:num_attack]
+
+            inputs_to_attack = inputs[indices].clone().detach()
+            data_samples_subset = [data_samples[i] for i in indices]
+
+            attacked_inputs = self._generate_adversarial_batch(inputs_to_attack, data_samples_subset)
+
+            inputs[indices] = attacked_inputs
+
+        with optim_wrapper.optim_context(self):
+            losses = self.loss(inputs, data_samples)
+        parsed_losses, log_vars = self.parse_losses(losses)
+        optim_wrapper.update_params(parsed_losses)
+        return log_vars
+
+    
+    def _generate_adversarial_batch(self, inputs, data_samples):
+        """ Generate adversarial examples for training, 
+        using the same CosPGD logic as evaluation-time attacks, 
+        but with training-specific settings (3 or 5 iterations, fixed epsilon/alpha from adv_train_cfg)
+        """
+
+        epsilon = self.adv_train_cfg["epsilon"]/255 if inputs.max() <= 1 else self.adv_train_cfg["epsilon"]
+        alpha = self.adv_train_cfg["alpha"]*255 if inputs.max() > 1 else self.adv_train_cfg["alpha"]
+
+        #normalize = torchvision.transforms.Normalize(mean=self.mean, std=self.std) if not self.enable_normalization else torch.nn.Identity()
+        if not self.enable_normalization:
+            _mean = torch.tensor(self.mean, device=inputs.device).view(1, 3, 1, 1)
+            _std = torch.tensor(self.std, device=inputs.device).view(1, 3, 1, 1)
+            normalize = lambda x: (x - _mean) / _std
+        else:
+            normalize = lambda x: x
+
+        orig_inputs = inputs.clone().detach()
+
+        if self.adv_train_cfg['norm'] == 'linf':
+            inputs = attack.init_linf(inputs, epsilon, clamp_min=0, clamp_max=255)
+        elif self.adv_train_cfg['norm'] == 'l2':
+            inputs = attack.init_l2(inputs, epsilon, clamp_min=0, clamp_max=255)
+        
+        for itr in range(self.adv_train_cfg['iterations']):
+            inputs.requires_grad = True
+            self.zero_grad()
+
+            with torch.enable_grad():
+                loss_temp = self.loss(normalize(inputs), data_samples)
+                loss = loss_temp['decode.loss_ce']
+
+                if self.adv_train_cfg['name'] == 'cospgd':
+                    seg_logits = self.encode_decode(normalize(inputs), [d.metainfo for d in data_samples])
+                    with torch.no_grad():
+                        metric = self.adv_train_cfg.get('metric', 'cosine')
+                        if metric == 'cosine':
+                            scale = self.cospgd_scale(seg_logits.detach(), data_samples[-1].gt_sem_seg.data.detach(), loss, num_classes=seg_logits.shape[1], targeted=False, one_hot=True)
+                        elif metric == 'l2':
+                            scale = self.l2_scale(seg_logits.detach(), data_samples[-1].gt_sem_seg.data.detach(), loss, num_classes=seg_logits.shape[1], targeted=False, one_hot=True)
+                        elif metric == 'l1':
+                            scale = self.l1_scale(seg_logits.detach(), data_samples[-1].gt_sem_seg.data.detach(), loss, num_classes=seg_logits.shape[1], targeted=False, one_hot=True)
+                        elif metric == 'jaccard':
+                            scale = self.jaccard_scale(seg_logits.detach(), data_samples[-1].gt_sem_seg.data.detach(), loss, num_classes=seg_logits.shape[1], targeted=False, one_hot=True)
+                        elif metric == 'minkowski':
+                            scale = self.minkowski_scale(seg_logits.detach(), data_samples[-1].gt_sem_seg.data.detach(), loss, num_classes=seg_logits.shape[1], targeted=False, one_hot=True)
+                        else:
+                            raise ValueError(f"Unknown metric: {metric}")
+                    loss = scale.detach() * loss
+
+
+                loss.mean().backward()
+
+            if self.adv_train_cfg['norm'] == 'linf':
+                inputs = attack.step_inf(inputs, epsilon, data_grad=inputs.grad, orig_image=orig_inputs, alpha=alpha, targeted=False, clamp_min=0, clamp_max=255)
+            elif self.adv_train_cfg['norm'] == 'l2':
+                inputs = attack.step_l2(inputs, epsilon, data_grad=inputs.grad, orig_image=orig_inputs, alpha=alpha, targeted=False, clamp_min=0, clamp_max=255)
+
+    
+        return inputs.detach()
+    
+
     def predict(self,
                 inputs: Tensor,
                 data_samples: OptSampleList = None) -> SampleList:
@@ -449,6 +598,9 @@ class EncoderDecoder(BaseSegmentor):
             - ``seg_logits``(PixelData): Predicted logits of semantic
                 segmentation before normalization.
         """
+
+        #        print("\n=== predict() called ===")
+        #        print("torch.is_grad_enabled():", torch.is_grad_enabled())
 
         if data_samples is not None:
             batch_img_metas = [
@@ -482,8 +634,14 @@ class EncoderDecoder(BaseSegmentor):
         # import pdb
         # pdb.set_trace()
 
-        normalize = torchvision.transforms.Normalize(mean = self.mean, std=self.std) if not self.enable_normalization else torch.nn.Identity()
-        
+        #normalize = torchvision.transforms.Normalize(mean = self.mean, std=self.std) if not self.enable_normalization else torch.nn.Identity()
+        if not self.enable_normalization:
+            _mean = torch.tensor(self.mean, device=inputs.device).view(1, 3, 1, 1)
+            _std = torch.tensor(self.std, device=inputs.device).view(1, 3, 1, 1)
+            normalize = lambda x: (x - _mean) / _std
+        else:
+            normalize = lambda x: x
+
         
         if self.perform_attack:
             if self.attack_cfg['name']=='apgd':
@@ -556,17 +714,72 @@ class EncoderDecoder(BaseSegmentor):
                                         align_corners=self.align_corners,
                                         warning=False)
                         
-                        
+                        #                        print("\nImmediately after computing logits")
+                        #                        print("torch.is_grad_enabled():", torch.is_grad_enabled())
+                        #                        print("resized_seg_logits.requires_grad:", resized_seg_logits.requires_grad)
+                        #                        print("resized_seg_logits.grad_fn:", resized_seg_logits.grad_fn)
                         
                         if self.attack_cfg['name'] == 'cospgd':
-                        
                             with torch.no_grad():
-                                
-                                cossim = self.cospgd_scale(resized_seg_logits.detach(), data_samples[-1].gt_sem_seg.data.detach(), loss, num_classes=resized_seg_logits.shape[1], targeted=self.attack_cfg['targeted'], one_hot=True)
-                            loss = cossim.detach() * loss
+                                metric = self.attack_cfg.get('metric', 'cosine')
+                                if metric == 'cosine':
+                                    scale = self.cospgd_scale(resized_seg_logits.detach(), data_samples[-1].gt_sem_seg.data.detach(), loss, num_classes=resized_seg_logits.shape[1], targeted=self.attack_cfg['targeted'], one_hot=True)
+                                elif metric == 'l2':
+                                    scale = self.l2_scale(resized_seg_logits.detach(), data_samples[-1].gt_sem_seg.data.detach(), loss, num_classes=resized_seg_logits.shape[1], targeted=self.attack_cfg['targeted'], one_hot=True)
+                                elif metric == 'l1':
+                                    scale = self.l1_scale(resized_seg_logits.detach(), data_samples[-1].gt_sem_seg.data.detach(), loss, num_classes=resized_seg_logits.shape[1], targeted=self.attack_cfg['targeted'], one_hot=True)
+                                elif metric == 'jaccard':
+                                    scale = self.jaccard_scale(resized_seg_logits.detach(), data_samples[-1].gt_sem_seg.data.detach(), loss, num_classes=resized_seg_logits.shape[1], targeted=self.attack_cfg['targeted'], one_hot=True)
+                                elif metric == 'minkowski':
+                                    scale = self.minkowski_scale(resized_seg_logits.detach(), data_samples[-1].gt_sem_seg.data.detach(), loss, num_classes=resized_seg_logits.shape[1], targeted=self.attack_cfg['targeted'], one_hot=True)
+                                else:
+                                    raise ValueError(f"Unknown metric: {metric}")
+                            loss = scale.detach() * loss
                         elif self.attack_cfg['name'] == 'segpgd':
                             loss = self.segpgd_scale(resized_seg_logits, data_samples[-1].gt_sem_seg.data, loss, iteration=itr, iterations=self.attack_cfg['iterations'], targeted=self.attack_cfg['targeted'])
                     
+                    #                    print(type(loss), flush=True)
+                    #                    print(loss.shape, flush=True)
+                    #                    print(loss.dtype, flush=True)
+
+                    #                    print("\n" + "=" * 70)
+                    #                    print(">>> ENTERED predict()")
+                    #                    print("=" * 70)
+
+                    #                    print("Grad enabled:", torch.is_grad_enabled())
+
+                    #                    print("\nINPUT")
+                    #                    print("inputs.requires_grad:", inputs.requires_grad)
+                    #                    print("inputs.grad_fn:", inputs.grad_fn)
+
+                    #                    print("\nLOGITS")
+                    #                    print("resized_seg_logits.requires_grad:", resized_seg_logits.requires_grad)
+                    #                    print("resized_seg_logits.grad_fn:", resized_seg_logits.grad_fn)
+                    #                    print("resized_seg_logits.dtype:", resized_seg_logits.dtype)
+                    #                    print("resized_seg_logits.shape:", resized_seg_logits.shape)
+
+                    #                    print("\nLOSS")
+                    #                    print("loss type:", type(loss))
+                    #                    print("loss.requires_grad:", loss.requires_grad)
+                    #                    print("loss.grad_fn:", loss.grad_fn)
+                    #                    print("loss.shape:", loss.shape)
+                    #                    print("loss.dtype:", loss.dtype)
+
+                    m = loss.mean()
+
+                    #                    print("\nMEAN LOSS")
+                    #                    print("m.requires_grad:", m.requires_grad)
+                    #                    print("m.grad_fn:", m.grad_fn)
+                    #                    print("m:", m)
+
+                    #                    print("=" * 70 + "\n")
+
+
+
+                    with torch.enable_grad():
+                        #                        print("Grad enabled:", torch.is_grad_enabled(), flush=True)
+                        #                        print("loss.requires_grad:", loss.requires_grad, flush=True)
+                        #                        print("loss.grad_fn:", loss.grad_fn, flush=True)
                     
                         loss.mean().backward()
                     

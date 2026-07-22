@@ -8,7 +8,7 @@ from mmengine.model import BaseModule
 
 try:
     from mmdet.models.dense_heads import MaskFormerHead as MMDET_MaskFormerHead
-except ModuleNotFoundError:
+except (ModuleNotFoundError, AssertionError):
     MMDET_MaskFormerHead = BaseModule
 
 from mmengine.structures import InstanceData

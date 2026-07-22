@@ -13,6 +13,9 @@ import warnings
 from torch import Tensor
 from mmseg.utils import (OptSampleList, SampleList)
 from .encoder_decoder import EncoderDecoder
+import torchvision
+from cospgd import functions as attack
+import math
 
 def resize(input,
            size=None,
@@ -53,7 +56,11 @@ class EncoderDecoderMask2Former(EncoderDecoder):
                  train_cfg=None,
                  test_cfg=None,
                  pretrained=None,
-                 init_cfg=None):
+                 init_cfg=None,
+                 attack_cfg=None,
+                 perform_attack=False,
+                 normalize_mean_std=None,
+                 enable_normalization=False):
         super(EncoderDecoder, self).__init__(init_cfg) #EncodeDecoder or EncoderDecoderMask2Former
         if pretrained is not None:
             assert backbone.get('pretrained') is None, \
@@ -69,6 +76,19 @@ class EncoderDecoderMask2Former(EncoderDecoder):
 
         self.train_cfg = train_cfg
         self.test_cfg = test_cfg
+
+        self.attack_cfg = attack_cfg
+        if attack_cfg is not None:
+            if "targeted" not in attack_cfg:
+                attack_cfg["targeted"] = False
+        self.perform_attack = perform_attack
+        self.enable_normalization = enable_normalization
+        if normalize_mean_std is not None:
+            self.mean = normalize_mean_std['mean']
+            self.std = normalize_mean_std['std']
+        else:
+            self.mean = [123.675, 116.28, 103.53]
+            self.std = [58.395, 57.12, 57.375]
 
         assert self.with_decode_head
 
@@ -390,6 +410,77 @@ class EncoderDecoderMask2Former(EncoderDecoder):
                     padding_size=[0, 0, 0, 0])
             ] * inputs.shape[0]
 
-        seg_logits = self.inference(inputs, batch_img_metas)
+        if self.attack_cfg is not None:
+            epsilon = self.attack_cfg["epsilon"]/255 if inputs.max() <= 1 else self.attack_cfg["epsilon"]
+            alpha = self.attack_cfg["alpha"]*255 if inputs.max() > 1 else self.attack_cfg["alpha"]
 
+        normalize = torchvision.transforms.Normalize(mean=self.mean, std=self.std) if not self.enable_normalization else torch.nn.Identity()
+
+        if self.perform_attack:
+            orig_inputs = inputs.clone().detach()
+            if 'pgd' in self.attack_cfg['name']:
+                if self.attack_cfg['norm'] == 'linf':
+                    inputs = attack.init_linf(inputs, epsilon, clamp_min=0, clamp_max=255)
+                elif self.attack_cfg['norm'] == 'l2':
+                    inputs = attack.init_l2(inputs, epsilon, clamp_min=0, clamp_max=255)
+                else:
+                    raise NotImplementedError('Norm ' + str(self.attack_cfg['norm']) + ' not implemented')
+            
+            for itr in range(self.attack_cfg['iterations']):
+                inputs.requires_grad = True
+                self.zero_grad()
+                with torch.enable_grad():
+                    seg_logits = self.inference(normalize(inputs), batch_img_metas, False)
+                    loss_temp = self.loss(normalize(inputs), data_samples)
+                    if 'decode.loss_ce' in loss_temp:
+                        loss = loss_temp['decode.loss_ce']
+                    elif 'decode.loss_dice' in loss_temp:
+                        loss = loss_temp['decode.loss_dice']
+                    elif 'decode.loss_focal' in loss_temp:
+                        loss = loss_temp['decode.loss_focal']
+                    else:
+                        raise AttributeError('Decoder has no loss defined')
+                    
+                    img_meta = batch_img_metas[0]
+                    batch_size, C, H, W = seg_logits.shape
+                    if 'img_padding_size' not in img_meta:
+                        padding_size = img_meta.get('padding_size', [0] * 4)
+                    else:
+                        padding_size = img_meta['img_padding_size']
+                    padding_left, padding_right, padding_top, padding_bottom = padding_size
+                    i_seg_logits = seg_logits[:, :, padding_top:H - padding_bottom, padding_left:W - padding_right]
+                    resized_seg_logits = resize(i_seg_logits, size=batch_img_metas[0]['ori_shape'], mode='bilinear', align_corners=self.align_corners, warning=False)
+
+                    if self.attack_cfg['name'] == 'cospgd':
+                        with torch.no_grad():
+                            metric = self.attack_cfg.get('metric', 'cosine')
+                            if metric == 'cosine':
+                                scale = self.cospgd_scale(resized_seg_logits.detach(), data_samples[-1].gt_sem_seg.data.detach(), loss, num_classes=resized_seg_logits.shape[1], targeted=self.attack_cfg['targeted'], one_hot=True)
+                            elif metric == 'l2':
+                                scale = self.l2_scale(resized_seg_logits.detach(), data_samples[-1].gt_sem_seg.data.detach(), loss, num_classes=resized_seg_logits.shape[1], targeted=self.attack_cfg['targeted'], one_hot=True)
+                            elif metric == 'l1':
+                                scale = self.l1_scale(resized_seg_logits.detach(), data_samples[-1].gt_sem_seg.data.detach(), loss, num_classes=resized_seg_logits.shape[1], targeted=self.attack_cfg['targeted'], one_hot=True)
+                            elif metric == 'jaccard':
+                                scale = self.jaccard_scale(resized_seg_logits.detach(), data_samples[-1].gt_sem_seg.data.detach(), loss, num_classes=resized_seg_logits.shape[1], targeted=self.attack_cfg['targeted'], one_hot=True)
+                            elif metric == 'minkowski':
+                                scale = self.minkowski_scale(resized_seg_logits.detach(), data_samples[-1].gt_sem_seg.data.detach(), loss, num_classes=resized_seg_logits.shape[1], targeted=self.attack_cfg['targeted'], one_hot=True)
+                            else: 
+                                raise ValueError(f"Unknown metric: {metric}")
+                            
+                        loss = scale.detach() * loss
+                    elif self.attack_cfg['name'] == 'segpgd':
+                        loss = self.segpgd_scale(resized_seg_logits, data_samples[-1].gt_sem_seg.data, loss, iteration=itr, iterations=self.attack_cfg['iterations'], targeted=self.attack_cfg['targeted'])
+
+                loss.mean().backward()
+
+                if self.attack_cfg['norm'] == 'linf':
+                    inputs = attack.step_inf(inputs, epsilon, data_grad=inputs.grad, orig_image=orig_inputs, alpha=alpha, targeted=self.attack_cfg['targeted'], clamp_min=0, clamp_max=255)
+                elif self.attack_cfg['norm'] == 'l2':
+                    inputs = attack.step_l2(inputs, epsilon, data_grad=inputs.grad, orig_image=orig_inputs, alpha=alpha, targeted=self.attack_cfg['targeted'], clamp_min=0, clamp_max=255)
+                else:
+                    raise NotImplementedError('Only linf and l2 norm implemented')
+
+
+
+        seg_logits = self.inference(normalize(inputs), batch_img_metas, False)
         return self.postprocess_result(seg_logits, data_samples)

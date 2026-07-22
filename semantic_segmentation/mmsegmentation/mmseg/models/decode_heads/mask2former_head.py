@@ -6,10 +6,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 from mmengine.model import BaseModule
 
+#try:
+    #from mmdet.models.dense_heads import \
+        #Mask2FormerHead as MMDET_Mask2FormerHead
+#except ModuleNotFoundError:
+    #MMDET_Mask2FormerHead = BaseModule
+
 try:
     from mmdet.models.dense_heads import \
         Mask2FormerHead as MMDET_Mask2FormerHead
-except ModuleNotFoundError:
+except (ModuleNotFoundError, AssertionError):
     MMDET_Mask2FormerHead = BaseModule
 
 from mmengine.structures import InstanceData
@@ -38,6 +44,10 @@ class Mask2FormerHead(MMDET_Mask2FormerHead):
                  num_classes,
                  align_corners=False,
                  ignore_index=255,
+                 in_channels=None,
+                 feat_channels=256,
+                 out_channels=256,
+                 num_queries=100,
                  **kwargs):
         super().__init__(**kwargs)
 
@@ -46,7 +56,7 @@ class Mask2FormerHead(MMDET_Mask2FormerHead):
         self.out_channels = num_classes
         self.ignore_index = ignore_index
 
-        feat_channels = kwargs['feat_channels']
+        #feat_channels = kwargs['feat_channels']
         self.cls_embed = nn.Linear(feat_channels, self.num_classes + 1)
 
     def _seg_data_to_instance_data(self, batch_data_samples: SampleList):

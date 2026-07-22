@@ -65,7 +65,7 @@ def load_model(model_name: str, backbone: str, dataset: str, crop_size: str = No
 
 
 def evaluate(
-    model_name: str, backbone: str, dataset: str, retrieve_existing: bool, threat_config: str, crop_size: str = None,
+    model_name: str, backbone: str, dataset: str, retrieve_existing: bool, threat_config: str, crop_size: str = None, metric: str = 'cosine', epsilon: float = None, iterations: int = None,
 ):
     """
     Evaluate a segmentation model under a specified robustness threat scenario. 
@@ -80,6 +80,9 @@ def evaluate(
     - retrieve_existing (bool): If True, returns cached results if a matching evaluation exists. Otherwise, reruns evaluation.
     - threat_config (str): Path to a YAML file defining the threat model and parameters for evaluation.
     - (optional) crop_size (str): Crop size variant if the model config varies by input size (e.g., '512x512').
+    - (optional) epsilon (float): Maximum perturbation magnitude for adversarial attack, expressed in pixel units (0-255 scale). If None,
+        falls back to the value in threat_config. Default: None.
+    - (optional) iterations (int): number of iterative steps for the adversarial attack. If None, falls back to the value defined in threat_config. Default: None
     """
     model_name = model_name.lower()
     backbone = backbone.lower()
@@ -148,8 +151,8 @@ def evaluate(
         return model, results
             
     elif threat_model in attacks:
-        iterations = int(config['iterations'])
-        epsilon = float(config['epsilon'])
+        iterations = iterations if iterations is not None else int(config['iterations'])
+        epsilon = epsilon if epsilon is not None else float(config['epsilon'])
         alpha = float(config['alpha'])
         lp_norm = config['lp_norm'].lower()
 
@@ -188,7 +191,8 @@ def evaluate(
             'model.attack_cfg.iterations': iterations,
             'model.attack_cfg.alpha': alpha,
             'model.attack_cfg.epsilon': epsilon,
-        }
+            'model.attack_cfg.metric': metric,
+	}
         args.work_dir = f'work_dirs/adv_attacks/{config_path.stem}/{threat_model}_{lp_norm}_iterations{iterations}_alpha{alpha}_epsilon{epsilon}'
         
         with torch.autocast(device_type="cuda"):

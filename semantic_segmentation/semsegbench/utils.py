@@ -28,10 +28,28 @@ def get_config_path(model_name: str, backbone: str, dataset: str, crop_size: str
     if backbone and 'resnet' in backbone:
         backbone = backbone.replace('resnet', 'r')
 
+    if backbone and 'internimage-' in backbone:
+        backbone = backbone.replace('internimage-', 'internimage_')
+
+    #old version commented out:
+    #architecture_config_path = Path(f"mmsegmentation/configs/{model_name}")
+    #if not architecture_config_path.is_dir():
+        #raise FileNotFoundError(f"No config directory found for model '{model_name}'")
+
+    #new version:
     architecture_config_path = Path(f"mmsegmentation/configs/{model_name}")
+    # check if directory exists and has configs matching this backbone
+    if architecture_config_path.is_dir():
+        test_configs = [ c for c in architecture_config_path.iterdir() if backbone in c.stem]
+        if not test_configs:
+            architecture_config_path = Path(f"configs/{model_name}")
+    else:
+        architecture_config_path = Path(f"configs/{model_name}")
     if not architecture_config_path.is_dir():
-        raise FileNotFoundError(f"No config directory found for model '{model_name}'")
-    
+        raise FileNotFoundError(f"No config directory found for model '{model_name}'") 
+
+
+
     configs_in_dir = [config_path for config_path in architecture_config_path.iterdir() if config_path.stem.startswith(model_name)]
         
     # filter by backbone, dataset and crop_size if given
@@ -51,6 +69,9 @@ def get_config_path(model_name: str, backbone: str, dataset: str, crop_size: str
 def get_checkpoint_path(model_name: str, backbone: str, dataset: str, crop_size: str = None) -> Path:
     if 'resnet' in backbone:
         backbone = backbone.replace('resnet', 'r')
+
+    if 'internimage' in backbone:
+        backbone = backbone.replace('internimage-', 'internimage_')
 
     # search for checkpoint file
     checkpoint_files_path = Path(f"checkpoints/{model_name}")
